@@ -33,7 +33,7 @@ AWS_REGION = "eu-west-1"
 COLLECTION_ID = "eyespy-faces"  
 
 # Backend server configuration
-DEFAULT_BACKEND_URL = "http://127.0.0.1:8080"
+DEFAULT_BACKEND_URL = "https://eyespy-server-199064163001.europe-southwest1.run.app"
 backend_url = os.environ.get("EYESPY_BACKEND_URL", DEFAULT_BACKEND_URL)
 
 # Initialize variables
