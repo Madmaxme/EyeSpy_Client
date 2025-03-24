@@ -33,7 +33,7 @@ AWS_REGION = "eu-west-1"
 COLLECTION_ID = "eyespy-faces"  
 
 # Backend server configuration
-DEFAULT_BACKEND_URL = "https://eyespy-server-199064163001.europe-southwest1.run.app"
+DEFAULT_BACKEND_URL = "http://127.0.0.1:8080"
 backend_url = os.environ.get("EYESPY_BACKEND_URL", DEFAULT_BACKEND_URL)
 
 # Initialize variables
@@ -404,14 +404,16 @@ def detect_faces_aws(frame):
         rejected_faces = {"confidence": 0, "pose": 0, "quality": 0, "landmarks": 0, "size": 0}
         
         for face_detail in response['FaceDetails']:
-            # Skip only extremely low confidence detections
-            if face_detail['Confidence'] < 85:  
+            # Relax confidence threshold to allow more detections
+            if face_detail['Confidence'] < 80:  # Lowered from 85
                 rejected_faces["confidence"] += 1
                 continue
             
-            # Skip only extremely extreme poses
+            # More lenient pose evaluation, especially for frontal faces
             pose = face_detail['Pose']
-            if abs(pose['Yaw']) > 60 or abs(pose['Pitch']) > 20:  
+            # More permissive for near-frontal faces (small yaw)
+            if (abs(pose['Yaw']) < 20 and abs(pose['Pitch']) > 25) or \
+               (abs(pose['Yaw']) >= 20 and (abs(pose['Yaw']) > 60 or abs(pose['Pitch']) > 20)):  
                 rejected_faces["pose"] += 1
                 continue
             
@@ -423,9 +425,18 @@ def detect_faces_aws(frame):
                 continue
 
             quality = face_detail['Quality']
-            if quality.get('Brightness', 0) < 40 or quality.get('Sharpness', 0) < 40:
-                rejected_faces["quality"] += 1
-                continue
+            # Adaptive quality thresholds based on pose
+            # For near-frontal faces, be more lenient with quality requirements
+            if abs(pose['Yaw']) < 15:
+                # Very frontal faces - be more lenient
+                if quality.get('Brightness', 0) < 30 or quality.get('Sharpness', 0) < 30:
+                    rejected_faces["quality"] += 1
+                    continue
+            else:
+                # Side profiles - maintain higher quality requirements
+                if quality.get('Brightness', 0) < 40 or quality.get('Sharpness', 0) < 40:
+                    rejected_faces["quality"] += 1
+                    continue
                 
             # Get bounding box
             bbox = face_detail['BoundingBox']
@@ -437,9 +448,11 @@ def detect_faces_aws(frame):
             right = int((bbox['Left'] + bbox['Width']) * width)
             bottom = int((bbox['Top'] + bbox['Height']) * height)
             
-            # Very minimal size filtering - only reject extremely tiny faces
+            # Adaptive size filtering based on pose
             face_height = bottom - top
-            if face_height < 80:  # Absolute pixel minimum rather than percentage
+            # More lenient for frontal faces
+            min_height = 70 if abs(pose['Yaw']) < 15 else 80
+            if face_height < min_height:
                 rejected_faces["size"] += 1
                 continue
             
