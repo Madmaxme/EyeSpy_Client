@@ -102,15 +102,6 @@ class InstagramLiveMonitor:
         try:
             # We're already on the user's profile page, no need to navigate
             
-            # Save a screenshot to debug the issue
-            debug_dir = "debug_screenshots"
-            if not os.path.exists(debug_dir):
-                os.makedirs(debug_dir)
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            screenshot_path = f"{debug_dir}/profile_{self.target_user}_{timestamp}.png"
-            self.driver.save_screenshot(screenshot_path)
-            print(f"Saved profile screenshot to {screenshot_path}")
-            
             # Refined set of Live indicators that exclude script tags and focus on visible elements
             live_indicators = [
                 # Standard text indicators in visible elements only
@@ -189,13 +180,6 @@ class InstagramLiveMonitor:
         print(f"Joining @{self.target_user}'s livestream...")
         
         try:
-            # Save a screenshot before trying to join
-            debug_dir = "debug_screenshots"
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            screenshot_path = f"{debug_dir}/before_join_{self.target_user}_{timestamp}.png"
-            self.driver.save_screenshot(screenshot_path)
-            print(f"Saved pre-join screenshot to {screenshot_path}")
-            
             # Try different selectors to find the livestream element
             join_selectors = [
                 # Original selector
@@ -255,12 +239,6 @@ class InstagramLiveMonitor:
                     
                     # Wait for the livestream to load
                     time.sleep(7)
-                    
-                    # Take a screenshot after clicking
-                    screenshot_path = f"{debug_dir}/after_click_{self.target_user}_{timestamp}.png"
-                    self.driver.save_screenshot(screenshot_path)
-                    print(f"Saved post-click screenshot to {screenshot_path}")
-                    
                     break
                 except Exception as e:
                     print(f"Failed with selector {i+1}: {e}")
@@ -304,8 +282,6 @@ class InstagramLiveMonitor:
                                 
                                 # Wait and check if we navigated to a new page
                                 time.sleep(5)
-                                screenshot_path = f"{debug_dir}/after_general_click_{i+1}_{timestamp}.png"
-                                self.driver.save_screenshot(screenshot_path)
                                 
                                 # Check if we're now on a video page
                                 if "video" in self.driver.current_url or "/live/" in self.driver.current_url:
@@ -356,37 +332,137 @@ class InstagramLiveMonitor:
     def get_stream_region(self):
         """Determine the screen region where the livestream is displayed."""
         try:
-            # Find the video element
-            video_element = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.TAG_NAME, "video"))
-            )
+            print("Waiting for video element to be fully loaded...")
+            # Give the page more time to load fully and render the video
+            time.sleep(3)
             
-            # Get the location and size of the video element
-            location = video_element.location
-            size = video_element.size
+            # Try to find the video element with multiple strategies
+            video_element = None
             
-            # Calculate the screen region
+            # Strategy 1: Find by video tag
+            try:
+                video_elements = self.driver.find_elements(By.TAG_NAME, "video")
+                if video_elements:
+                    # If multiple videos, try to find the largest one
+                    largest_video = None
+                    largest_area = 0
+                    
+                    for video in video_elements:
+                        if video.is_displayed():
+                            size = video.size
+                            area = size['width'] * size['height']
+                            if area > largest_area:
+                                largest_area = area
+                                largest_video = video
+                    
+                    if largest_video:
+                        video_element = largest_video
+                        print(f"Found video element by tag with size: {largest_video.size}")
+            except Exception as e:
+                print(f"Error finding video by tag: {e}")
+            
+            # Strategy 2: Try to find by role or aria-label if first approach failed
+            if not video_element:
+                try:
+                    video_container = self.driver.find_element(By.XPATH, "//div[@role='dialog' and contains(@aria-label, 'live')]")
+                    # Try to find video within this container
+                    video_element = video_container.find_element(By.TAG_NAME, "video")
+                    print("Found video element within dialog container")
+                except Exception as e:
+                    print(f"Error finding video container: {e}")
+            
+            # Strategy 3: If we still don't have a video element, look for a large container
+            if not video_element:
+                try:
+                    # Look for large central element that might contain the video
+                    containers = self.driver.find_elements(By.XPATH, "//div[contains(@style, 'width') and contains(@style, 'height')]")
+                    
+                    # Filter for large elements
+                    largest_container = None
+                    largest_area = 0
+                    
+                    for container in containers:
+                        if container.is_displayed():
+                            size = container.size
+                            if size['width'] > 300 and size['height'] > 300:
+                                area = size['width'] * size['height']
+                                if area > largest_area:
+                                    largest_area = area
+                                    largest_container = container
+                    
+                    if largest_container:
+                        video_element = largest_container
+                        print(f"Using largest container as fallback with size: {largest_container.size}")
+                except Exception as e:
+                    print(f"Error finding container: {e}")
+            
+            # If we found a video element or container, calculate the region
+            if video_element:
+                # Get the location and size
+                location = video_element.location
+                size = video_element.size
+                
+                # Calculate initial region
+                region = {
+                    "left": location['x'],
+                    "top": location['y'],
+                    "width": size['width'],
+                    "height": size['height']
+                }
+                
+                # Get viewport dimensions
+                viewport_width = self.driver.execute_script("return window.innerWidth")
+                viewport_height = self.driver.execute_script("return window.innerHeight")
+                
+                # Simply force a much lower position - around 20% lower than before
+                # Set a fixed offset of 180px from the top (was 130px before)
+                minimum_top_offset = 180
+                
+                # Adjust the region regardless of the detected position
+                # This ensures we're always well below the navigation
+                height_adjusted = region["height"]
+                if region["top"] < minimum_top_offset:
+                    height_adjusted = region["height"] - (minimum_top_offset - region["top"])
+                
+                # Force the top position to our minimum offset
+                region["top"] = minimum_top_offset
+                region["height"] = max(300, height_adjusted)
+                
+                # Increase height by 20% to lengthen the bottom of the monitoring area
+                region["height"] = int(region["height"] * 1.2)
+                
+                # Add some margin but keep within screen bounds
+                margin = 20
+                region["left"] = max(0, region["left"] - margin)
+                region["width"] = min(viewport_width - region["left"], region["width"] + 2 * margin)
+                
+                print(f"Detected livestream region: {region}")
+                return region
+                
+            # If all detection methods fail, use page dimensions to create a reasonable region
+            print("Could not detect video element, using screen dimensions")
+            
+            # Get viewport dimensions
+            viewport_width = self.driver.execute_script("return window.innerWidth")
+            viewport_height = self.driver.execute_script("return window.innerHeight")
+            
+            # Use central portion of the screen, starting much lower (40% down from top)
             region = {
-                "left": location['x'],
-                "top": location['y'],
-                "width": size['width'],
-                "height": size['height']
+                "left": int(viewport_width * 0.25),
+                "top": int(viewport_height * 0.4),  # Start 40% down (was 30%)
+                "width": int(viewport_width * 0.5),
+                "height": int(viewport_height * 0.4 * 1.2)  # Increased height by 20%
             }
             
-            # Add some margin
-            margin = 10
-            region["left"] = max(0, region["left"] - margin)
-            region["top"] = max(0, region["top"] - margin)
-            region["width"] += 2 * margin
-            region["height"] += 2 * margin
-            
-            print(f"Detected livestream region: {region}")
+            print(f"Created fallback region based on viewport: {region}")
             return region
             
         except Exception as e:
             print(f"Error determining stream region: {e}")
-            print("Using default region")
-            return {"top": 200, "left": 400, "width": 600, "height": 800}
+            print("Using default central region")
+            
+            # Use a lower fixed position with 20% more height
+            return {"top": 250, "left": 400, "width": 600, "height": 540}  # Increased from 450 to 540
             
     def is_stream_still_active(self):
         """Check if the livestream is still active."""
@@ -425,35 +501,190 @@ class InstagramLiveMonitor:
         print("Starting InstaRec face recognition...")
         
         try:
-            # First, check if ScreenCapture can be configured with a region
-            try:
-                # Configure ScreenCapture with the region (if it accepts region parameter)
-                print(f"Setting up ScreenCapture with region: {region}")
-                # This is a workaround - we'll set the region as a module-level variable
-                # that InstaRec can access if it's designed to check for it
-                import InstaRec
-                if hasattr(InstaRec, 'set_capture_region'):
-                    InstaRec.set_capture_region(region)
-                else:
-                    # Try to set attributes directly
-                    if not hasattr(InstaRec, 'capture_region'):
-                        setattr(InstaRec, 'capture_region', region)
-                    print("Set capture_region attribute on InstaRec module")
-            except Exception as config_error:
-                print(f"Note: Could not configure ScreenCapture with region: {config_error}")
-                print("InstaRec will use its default region detection")
+            # Create a temporary Python script that will run the modified InstaRec
+            temp_script_path = "run_instarec.py"
+            with open(temp_script_path, "w") as f:
+                f.write(f"""
+import sys
+import os
+import json
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import InstaRec
+
+# Set the region directly
+region = {{"left": {region["left"]}, "top": {region["top"]}, "width": {region["width"]}, "height": {region["height"]}}}
+
+# Override the GUI method to avoid Tkinter issues
+from types import MethodType
+
+def get_screen_region_override(self):
+    print("Using automatically detected region:", region)
+    return region
+
+# Create a modified version of main that skips GUI prompting
+def main_override(server_url=None):
+    global backend_url, processing_enabled
+    
+    print("\\n==== Instagram Live Face Recognition ====")
+    
+    # Set backend URL if provided
+    if server_url:
+        InstaRec.backend_url = server_url
+    
+    # Skip AWS checks for now to avoid errors
+    print(f"Using auto-detected region: {{region}}")
+    
+    # Create screen capture directly with our region
+    capture = InstaRec.ScreenCapture(region=region)
+    capture.start()
+    
+    # Create face detector
+    face_detector = InstaRec.FaceDetector(face_display_time=InstaRec.face_display_time)
+    
+    # Create monitoring window and position it away from the capture region
+    import cv2
+    cv2.namedWindow("Instagram Face Recognition", cv2.WINDOW_NORMAL)
+    cv2.moveWindow("Instagram Face Recognition", max(region["left"] + region["width"] + 50, 100), 50)
+    cv2.resizeWindow("Instagram Face Recognition", 800, 600)
+    
+    # Set up face processing
+    InstaRec.processing_enabled = True
+    frame_counter = 0
+    face_detection_count = 0
+    matched_faces_count = 0
+    face_detection_thread_active = False
+    face_frame = None
+    detected_faces = []
+    
+    # Define and start the face detection worker thread
+    import threading
+    
+    def face_detection_worker():
+        nonlocal face_frame, face_detection_count, face_detection_thread_active, detected_faces, matched_faces_count
+        print("Face detection worker started")
+        processing_count = 0
+        while InstaRec.processing_enabled and face_detection_thread_active:
+            if face_frame is not None:
+                local_frame = face_frame.copy()
+                face_frame = None
+                processing_count += 1
+                try:
+                    # Detect faces with AWS Rekognition
+                    faces = InstaRec.detect_faces_aws(local_frame)
+                    if faces:
+                        # Update face detector with new faces for display
+                        face_detector.update_faces([face['bbox'] for face in faces])
+                        detected_faces = faces
+                        for face in faces:
+                            bbox = face['bbox']
+                            result = InstaRec.process_face(local_frame, bbox)
+                            if result:
+                                if result.get('matched', False):
+                                    matched_faces_count += 1
+                                else:
+                                    face_detection_count += 1
+                                    # Register detection to show indicator
+                                    face_detector.register_detection(bbox, not result.get('matched', False))
+                except Exception as e:
+                    print(f"Error in face detection thread: {{e}}")
+                if processing_count % 10 == 0:
+                    print(f"Processed {{processing_count}} frames, found {{face_detection_count}} new faces, matched {{matched_faces_count}}")
+            import time
+            time.sleep(0.01)
+        print("Face detection thread stopped")
+    
+    face_detection_thread_active = True
+    detection_thread = threading.Thread(target=face_detection_worker, daemon=True)
+    detection_thread.start()
+    
+    import time
+    
+    # Main monitoring loop
+    running = True
+    try:
+        print("Starting face recognition monitoring...")
+        print("Monitoring started - press 'q' to quit")
+        
+        while running:
+            frame = capture.get_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
             
-            # Launch InstaRec in a separate thread, without passing region parameter
-            print("Launching InstaRec monitoring thread")
-            instarec_thread = threading.Thread(
-                target=instarec_main,
-                args=(self.backend_url,),
-                # Removed the region parameter from kwargs
-                daemon=True
-            )
-            instarec_thread.start()
+            frame_counter += 1
+            if InstaRec.processing_enabled and frame_counter % InstaRec.process_every_n == 0:
+                if face_frame is None:
+                    face_frame = frame.copy()
             
-            print("InstaRec monitoring thread started")
+            active_faces = face_detector.get_active_faces()
+            display_frame = frame.copy()
+            display_frame = face_detector.draw_indicators(display_frame)
+            
+            for (left, top, right, bottom) in active_faces:
+                cv2.rectangle(display_frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            
+            if InstaRec.processing_enabled:
+                status_text = f"Processing: ON (1 frame every {{InstaRec.process_every_n}})"
+                status_color = (0, 255, 0)
+            else:
+                status_text = "Processing: PAUSED (press 'p' to resume)"
+                status_color = (0, 0, 255)
+            
+            cv2.putText(display_frame, "Instagram Live Face Recognition", 
+                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(display_frame, f"FPS: {{capture.get_fps():.1f}} | Faces: {{len(active_faces)}}", 
+                      (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(display_frame, f"New faces: {{face_detection_count}} | Matched: {{matched_faces_count}}", 
+                      (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(display_frame, status_text, 
+                      (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+            
+            cv2.imshow("Instagram Face Recognition", display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("Quit requested")
+                running = False
+            elif key == ord('p'):
+                InstaRec.processing_enabled = not InstaRec.processing_enabled
+                status = "RESUMED" if InstaRec.processing_enabled else "PAUSED"
+                print(f"Face processing {{status}}")
+    
+    except Exception as e:
+        print(f"Error during monitoring: {{e}}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        face_detection_thread_active = False
+        if 'detection_thread' in locals():
+            detection_thread.join(timeout=1.0)
+        capture.stop()
+        cv2.destroyAllWindows()
+        print(f"Monitoring stopped - {{face_detection_count}} new faces detected")
+
+# Apply the override
+InstaRec.ScreenRegionSelector.get_screen_region = MethodType(get_screen_region_override, InstaRec.ScreenRegionSelector())
+InstaRec.main = main_override
+
+# Run InstaRec main with the server URL
+backend_url = "{self.backend_url or 'http://35.180.226.30:8080'}"
+try:
+    InstaRec.main(server_url=backend_url)
+except Exception as e:
+    print(f"Error running InstaRec: {{e}}")
+    import traceback
+    traceback.print_exc()
+""")
+            
+            # Launch the script in a new process
+            print("Launching InstaRec in a separate process")
+            import subprocess
+            import sys
+            
+            # Use a non-blocking approach to start the process
+            instarec_process = subprocess.Popen([sys.executable, temp_script_path])
+            
+            print("InstaRec monitoring process started")
             
             # Keep monitoring while the stream is active
             while self.is_monitoring and self.is_stream_still_active():
@@ -461,6 +692,20 @@ class InstagramLiveMonitor:
                 
             print("Livestream monitoring ended")
             self.current_live_session = False
+            
+            # Terminate the InstaRec process when done
+            if instarec_process:
+                try:
+                    instarec_process.terminate()
+                    print("InstaRec process terminated")
+                except:
+                    pass
+                
+            # Clean up the temporary script
+            try:
+                os.remove(temp_script_path)
+            except:
+                pass
             
         except Exception as e:
             print(f"Error in InstaRec monitoring: {e}")
@@ -471,6 +716,9 @@ class InstagramLiveMonitor:
         """Main monitoring loop with manual login flow."""
         print(f"Starting monitoring loop for @{self.target_user}")
         self.is_monitoring = True
+        
+        # Use a much shorter check interval when not in a live session
+        check_interval_short = 5  # Check every 5 seconds when not in a live session
         
         try:
             # First, wait for the user to navigate to the target profile
@@ -507,9 +755,12 @@ class InstagramLiveMonitor:
                             
                             # Start InstaRec monitoring
                             self.start_instarec_monitoring(region)
-                
-                # Wait before checking again
-                time.sleep(self.check_interval)
+                    
+                    # Use the shorter check interval when not in a live session
+                    time.sleep(check_interval_short)
+                else:
+                    # Use the standard longer interval when in a live session
+                    time.sleep(self.check_interval)
                 
         except KeyboardInterrupt:
             print("Monitoring stopped by user")
@@ -550,6 +801,16 @@ def main():
         headless=args.headless,
         backend_url=args.backend
     )
+    
+    # Print instructions before starting
+    print("\n=== Instagram Live Monitor ===")
+    print("1. A Chrome browser window will open")
+    print("2. Log in to Instagram manually")
+    print(f"3. Navigate to https://www.instagram.com/{args.user}")
+    print("4. The script will automatically check for live streams")
+    print("5. When a live stream is detected, it will join and start recording")
+    print("6. Press Ctrl+C to quit\n")
+    
     monitor.start()
 
 if __name__ == "__main__":
