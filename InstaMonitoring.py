@@ -45,6 +45,7 @@ class InstagramLiveMonitor:
         self.is_monitoring = False
         self.current_live_session = False
         self.target_url = f"{INSTAGRAM_URL}/{self.target_user}/"
+        self.instarec_process = None
             
         print(f"Monitor initialized for Instagram user: @{self.target_user}")
         print(f"Will check for live streams every {self.check_interval} seconds")
@@ -461,41 +462,116 @@ class InstagramLiveMonitor:
             print(f"Error determining stream region: {e}")
             print("Using default central region")
             
-            # Use a lower fixed position with 20% more height
+            # Since we couldn't detect properly, use a central region that's lower down
             return {"top": 250, "left": 400, "width": 600, "height": 540}  # Increased from 450 to 540
             
     def is_stream_still_active(self):
         """Check if the livestream is still active."""
         try:
-            # Look for elements that indicate the stream is still active
+            # Look for specific indicators that the stream has ended
+            end_indicators = [
+                "//div[contains(text(), 'Live Video Ended')]",
+                "//span[contains(text(), 'Live Video Ended')]",
+                "//div[text()='Live Video Ended']",
+                "//span[text()='Live Video Ended']",
+                "//div[contains(text(), 'Thank you for watching')]",
+                "//span[contains(text(), 'Thank you for watching')]",
+                "//div[contains(text(), 'ended')]",
+                "//span[contains(text(), 'ended')]"
+            ]
+            
+            for indicator in end_indicators:
+                try:
+                    end_element = self.driver.find_element(By.XPATH, indicator)
+                    if end_element.is_displayed():
+                        print(f"Stream ended indicator found: '{end_element.text}'")
+                        return False
+                except NoSuchElementException:
+                    continue
+            
+            # If no end indicators are found, the stream is probably still active
+            # But let's verify there's still a video element
             try:
                 video_element = self.driver.find_element(By.TAG_NAME, "video")
-                return True
+                if video_element.is_displayed():
+                    # Stream is still active
+                    return True
             except NoSuchElementException:
-                pass
-                
-            # Check for "Live" text
-            try:
-                live_text = self.driver.find_element(By.XPATH, "//span[contains(text(), 'Live')]")
-                return True
-            except NoSuchElementException:
-                pass
-                
-            # Check for end of broadcast message
-            try:
-                end_message = self.driver.find_element(By.XPATH, "//span[contains(text(), 'ended') or contains(text(), 'This live video has ended')]")
-                print("Livestream has ended")
+                # No video element found
+                print("No video element found, stream may have ended")
                 return False
-            except NoSuchElementException:
-                pass
-                
-            # If we can't determine status, assume still active
+            
+            # Default to assuming the stream is still active if we can't tell otherwise
             return True
             
         except Exception as e:
             print(f"Error checking if stream is still active: {e}")
-            return False
+            # Default to true if there's an error to prevent unexpected termination
+            return True
             
+    def return_to_profile_page(self):
+        """Close the live stream and return to the user's profile page."""
+        print(f"Returning to @{self.target_user}'s profile page...")
+        
+        try:
+            # Look for the X button at the top right of the live stream
+            close_button_selectors = [
+                "//button[@aria-label='Close']",
+                "//div[@role='button' and @aria-label='Close']",
+                "//div[@role='button']//*[local-name()='svg' and contains(@aria-label, 'Close')]",
+                "//button[text()='×']",  # × character
+                "//button[text()='X']",
+                "//div[@role='button' and contains(@class, 'close')]",
+                "//div[@role='button' and contains(@class, 'exit')]",
+                # Try to find by position in the top right corner
+                "//div[@role='button' and (contains(@style, 'right') or contains(@class, 'right'))]"
+            ]
+            
+            # Try each selector
+            for selector in close_button_selectors:
+                try:
+                    close_button = WebDriverWait(self.driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                    
+                    # Found a close button, click it
+                    print(f"Found close button: {close_button.tag_name}")
+                    close_button.click()
+                    print("Clicked close button")
+                    
+                    # Wait for navigation to complete
+                    time.sleep(2)
+                    
+                    # Check if we're back on the profile page
+                    if self.target_user in self.driver.current_url:
+                        print(f"Successfully returned to @{self.target_user}'s profile page")
+                        return True
+                    else:
+                        print(f"Not on profile page after clicking close. Current URL: {self.driver.current_url}")
+                        # Try to navigate directly to the profile
+                        self.driver.get(self.target_url)
+                        time.sleep(2)
+                        return True
+                        
+                except (TimeoutException, NoSuchElementException):
+                    continue
+            
+            # If no close button found, navigate directly to the profile
+            print("No close button found, navigating directly to profile page")
+            self.driver.get(self.target_url)
+            time.sleep(2)
+            return True
+            
+        except Exception as e:
+            print(f"Error returning to profile page: {e}")
+            # Try direct navigation as a fallback
+            try:
+                self.driver.get(self.target_url)
+                time.sleep(2)
+                return True
+            except:
+                return False
+                
     def start_instarec_monitoring(self, region):
         """Start InstaRec monitoring for the given region."""
         print("Starting InstaRec face recognition...")
@@ -683,24 +759,32 @@ except Exception as e:
             
             # Use a non-blocking approach to start the process
             instarec_process = subprocess.Popen([sys.executable, temp_script_path])
+            self.instarec_process = instarec_process  # Store it on self so it can be accessed later
             
             print("InstaRec monitoring process started")
             
             # Keep monitoring while the stream is active
+            check_interval = 5  # Check every 5 seconds if stream is still active
             while self.is_monitoring and self.is_stream_still_active():
-                time.sleep(10)
-                
+                time.sleep(check_interval)
+            
+            # Stream has ended or monitoring was stopped
             print("Livestream monitoring ended")
             self.current_live_session = False
             
             # Terminate the InstaRec process when done
-            if instarec_process:
+            if self.instarec_process:
                 try:
-                    instarec_process.terminate()
+                    self.instarec_process.terminate()
                     print("InstaRec process terminated")
                 except:
                     pass
-                
+                self.instarec_process = None
+            
+            # Return to profile page if the stream has ended (and we're still monitoring)
+            if self.is_monitoring:
+                self.return_to_profile_page()
+            
             # Clean up the temporary script
             try:
                 os.remove(temp_script_path)
