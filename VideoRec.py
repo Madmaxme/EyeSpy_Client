@@ -20,10 +20,6 @@ load_dotenv()
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Create directory to save face screenshots
-save_dir = os.path.join(script_dir, "detected_faces")
-if not os.path.exists(save_dir):
-    os.makedirs(save_dir)
-    print(f"Created detected faces directory: {save_dir}")
 
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY") 
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")  
@@ -704,23 +700,15 @@ def save_face(frame, bbox):
             print("Detection throttled - waiting for cooldown")
             return None
         
-        # Generate filename with timestamp and face ID
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{save_dir}/face_{timestamp}_{face_id[:8]}.jpg"
-        
-        # Save face image
-        cv2.imwrite(filename, face_image)
-        print(f"New face saved: {filename}")
-        
-        # Upload to backend
+        # Upload face image directly to backend (in-memory)
+        _, img_encoded = cv2.imencode('.jpg', face_image)
         thread = threading.Thread(
             target=upload_to_backend,
-            args=(filename,),
+            args=(img_encoded.tobytes(),),
             daemon=True
         )
         thread.start()
-        
-        return {'matched': False, 'face_id': face_id, 'filename': filename}
+        return {'matched': False, 'face_id': face_id}
     except Exception as e:
         print(f"Error saving face: {e}")
         return None
