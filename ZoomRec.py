@@ -4,14 +4,43 @@ import boto3
 import threading
 import time
 import os
-import pickle
 import json
 import requests
 import uuid
+import argparse
+import platform
 from datetime import datetime
 from queue import Queue, Empty, Full
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
+
+# Import screen capture libraries based on platform
+try:
+    import pyautogui  # For screenshot capabilities
+    
+    # For window handling
+    system = platform.system()
+    if system == "Darwin":  # macOS
+        # Mac doesn't work with pygetwindow in the same way
+        MAC_MODE = True
+        try:
+            import Quartz
+            QUARTZ_AVAILABLE = True
+        except ImportError:
+            QUARTZ_AVAILABLE = False
+            print("Warning: For better window detection on Mac, install PyObjC:")
+            print("pip install pyobjc-core pyobjc-framework-Quartz")
+    else:  # Windows/Linux
+        MAC_MODE = False
+        import pygetwindow as gw
+except ImportError:
+    print("Error: Required packages not installed. Please install with:")
+    print("pip install pyautogui")
+    if platform.system() == "Darwin":
+        print("For Mac, also consider: pip install pyobjc-core pyobjc-framework-Quartz")
+    else:
+        print("pip install pygetwindow")
+    exit(1)
 
 load_dotenv()
 
@@ -26,7 +55,7 @@ if not os.path.exists(save_dir):
 
 AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY") 
 AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY")  
-AWS_REGION = "eu-west-1" 
+AWS_REGION = "eu-west-1"
 
 # AWS Collection to store face data - You can change this name if desired
 COLLECTION_ID = "eyespy-faces"  
@@ -37,7 +66,7 @@ backend_url = os.environ.get("EYESPY_BACKEND_URL", DEFAULT_BACKEND_URL)
 
 # Initialize variables
 last_detection_time = 0
-detection_throttle = 1.0  # Seconds between detections
+detection_throttle = 3.0  # Seconds between detections
 processing_enabled = True  # Flag to enable/disable face processing
 
 # Face indicator display time (in seconds)
@@ -58,8 +87,6 @@ def get_rekognition_client():
     except Exception as e:
         print(f"Error initializing AWS Rekognition: {e}")
         return None
-
-# AWS Rekognition handles face tracking, no need to track face IDs locally
 
 def get_collection_face_count():
     """Get the number of faces in the AWS collection"""
@@ -95,17 +122,16 @@ def ensure_collection_exists():
     except Exception as e:
         print(f"Error with AWS collection: {e}")
         return False
-        
+    
 class FaceTracker:
-    def __init__(self, stability_threshold=4, position_tolerance=0.15):
+    def __init__(self, stability_threshold=3, position_tolerance=0.15):
         """
-        Initialize face tracker with more lenient parameters
+        Initialize face tracker with more lenient parameters for Zoom
         
         Args:
             stability_threshold: Number of consecutive frames a face must appear to be considered stable
-                                (reduced to 4 from 2)
+                                (reduced for Zoom participants who may be moving)
             position_tolerance: Maximum change in normalized position to be considered the same face
-                               (increased to 0.15 from 0.2)
         """
         self.tracked_faces = {}  # Dictionary of tracked faces
         self.next_face_id = 0  # Counter for generating face IDs
@@ -271,64 +297,175 @@ class FaceDetector:
         
         return result_frame
 
-class WebcamCapture:
-    """Webcam capture class using direct OpenCV access"""
-    def __init__(self, camera_id=0, width=640, height=480):
-        self.camera_id = camera_id
-        self.width = width 
-        self.height = height
-        self.frame_queue = Queue(maxsize=2)
+class ZoomCapture:
+    """Capture class for Zoom windows with cross-platform support"""
+    def __init__(self):
+        self.frame_queue = Queue(maxsize=10)
         self.running = False
         self.thread = None
         self.fps = 0
         self.last_frame_time = time.time()
         self.frame_count = 0
+        self.zoom_window = None
+        self.region = None  # Region to capture (left, top, width, height)
+        self.manual_region = False  # Whether region was manually set
+        
+    def find_zoom_window(self):
+        """Find the Zoom window with platform-specific methods"""
+        try:
+            if MAC_MODE:
+                # macOS approach
+                if QUARTZ_AVAILABLE:
+                    # Try to find Zoom window using Quartz
+                    windows = Quartz.CGWindowListCopyWindowInfo(
+                        Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+                        Quartz.kCGNullWindowID
+                    )
+                    
+                    for window in windows:
+                        name = window.get('kCGWindowOwnerName', '')
+                        if 'zoom' in name.lower():
+                            # Found Zoom window
+                            self.zoom_window = {
+                                'title': name,
+                                'left': window.get('kCGWindowBounds', {}).get('X', 0),
+                                'top': window.get('kCGWindowBounds', {}).get('Y', 0),
+                                'width': window.get('kCGWindowBounds', {}).get('Width', 800),
+                                'height': window.get('kCGWindowBounds', {}).get('Height', 600)
+                            }
+                            print(f"Found Zoom window: {self.zoom_window['title']}, " +
+                                  f"Size: {self.zoom_window['width']}x{self.zoom_window['height']}")
+                            self.region = (
+                                self.zoom_window['left'], 
+                                self.zoom_window['top'], 
+                                self.zoom_window['width'], 
+                                self.zoom_window['height']
+                            )
+                            return True
+                
+                # If Quartz failed or Zoom window not found, ask for manual region
+                if not self.manual_region:
+                    print("Zoom window not automatically detected on macOS.")
+                    return self.ask_manual_region()
+                return True
+            else:
+                # Windows/Linux approach
+                zoom_titles = ["Zoom Meeting", "Zoom", "Zoom Call", "Zoom Webinar"]
+                
+                for title in zoom_titles:
+                    zoom_windows = [w for w in gw.getAllWindows() if 
+                                    title in w.title and w.visible]
+                    if zoom_windows:
+                        self.zoom_window = zoom_windows[0]
+                        print(f"Found Zoom window: {self.zoom_window.title}, " +
+                              f"Size: {self.zoom_window.width}x{self.zoom_window.height}")
+                        self.region = (
+                            self.zoom_window.left, 
+                            self.zoom_window.top, 
+                            self.zoom_window.width, 
+                            self.zoom_window.height
+                        )
+                        return True
+                
+                # If Zoom window not found, ask for manual region
+                print("No Zoom window found. Make sure Zoom is running with an active call.")
+                return self.ask_manual_region()
+        except Exception as e:
+            print(f"Error finding Zoom window: {e}")
+            return self.ask_manual_region()
+    
+    def ask_manual_region(self):
+        """Ask user to manually specify the region"""
+        try:
+            print("\nLet's capture the Zoom meeting window manually.")
+            print("Please position your Zoom window where you want it.")
+            input("Press Enter when ready, then you'll have 5 seconds to position your mouse at the TOP-LEFT corner of the Zoom window...")
+            
+            # Give user time to position
+            for i in range(5, 0, -1):
+                print(f"{i}...")
+                time.sleep(1)
+            
+            # Get top-left position
+            top_left = pyautogui.position()
+            print(f"Top-left recorded at {top_left.x}, {top_left.y}")
+            
+            input("Now position your mouse at the BOTTOM-RIGHT corner of the Zoom window and press Enter...")
+            
+            # Give user time to position
+            for i in range(5, 0, -1):
+                print(f"{i}...")
+                time.sleep(1)
+            
+            # Get bottom-right position
+            bottom_right = pyautogui.position()
+            print(f"Bottom-right recorded at {bottom_right.x}, {bottom_right.y}")
+            
+            # Calculate region
+            width = bottom_right.x - top_left.x
+            height = bottom_right.y - top_left.y
+            
+            if width <= 0 or height <= 0:
+                print("Error: Invalid selection (width or height is zero or negative)")
+                return False
+            
+            self.region = (top_left.x, top_left.y, width, height)
+            print(f"Manual capture region set: {self.region}")
+            self.manual_region = True
+            return True
+        except Exception as e:
+            print(f"Error setting manual region: {e}")
+            return False
         
     def start(self):
-        """Start capturing from webcam"""
-        self.running = True
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.capture_thread.start()
-        print(f"Started capturing from webcam {self.camera_id}")
-        return True
+        """Start capturing from Zoom window"""
+        if self.find_zoom_window():
+            self.running = True
+            self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self.capture_thread.start()
+            print("Started capturing Zoom window")
+            return True
+        return False
     
     def stop(self):
         """Stop capturing"""
         self.running = False
         if self.capture_thread:
             self.capture_thread.join(timeout=1.0)
-        print("Stopped webcam capture")
+        print("Stopped Zoom capture")
     
     def _capture_loop(self):
-        """Continuously capture frames from webcam"""
-        # Initialize webcam
-        camera = cv2.VideoCapture(self.camera_id)
-        
-        # Set resolution
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        
-        # Set camera buffer size to 1 frame
-        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
-        actual_width = camera.get(cv2.CAP_PROP_FRAME_WIDTH)
-        actual_height = camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        print(f"Webcam initialized at resolution: {actual_width}x{actual_height}")
-        
+        """Continuously capture Zoom window"""
         while self.running:
             try:
-                # Capture frame
-                ret, frame = camera.read()
+                # Check if we need to refresh the window position (not for manual mode)
+                if not self.manual_region:
+                    if (MAC_MODE and not self.region) or (not MAC_MODE and (not self.zoom_window or not self.zoom_window.visible)):
+                        # Try to find the window again
+                        if not self.find_zoom_window():
+                            time.sleep(1)  # Wait a second before retrying
+                            continue
                 
-                if not ret:
-                    print("Error reading from webcam")
-                    time.sleep(0.1)
+                # Take the screenshot
+                try:
+                    screenshot = pyautogui.screenshot(region=self.region)
+                except Exception as e:
+                    print(f"Error capturing screen region {self.region}: {e}")
+                    time.sleep(0.5)
                     continue
+                
+                # Convert PIL image to OpenCV format
+                frame = np.array(screenshot)
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 
                 # Update queue
                 try:
                     if self.frame_queue.full():
-                        self.frame_queue.get_nowait()
+                        try:
+                            # Try to clear some frames if queue is full
+                            self.frame_queue.get_nowait()
+                        except Empty:
+                            pass
                     self.frame_queue.put_nowait(frame)
                     
                     # Update FPS calculation
@@ -338,14 +475,15 @@ class WebcamCapture:
                         self.fps = self.frame_count / (now - self.last_frame_time)
                         self.frame_count = 0
                         self.last_frame_time = now
-                except Empty:
-                    pass
+                except Exception as e:
+                    print(f"Error updating frame queue: {e}")
+                
+                # Add a small delay to reduce CPU usage
+                time.sleep(0.05)
+                
             except Exception as e:
-                print(f"Error capturing frame: {e}")
+                print(f"Error capturing Zoom window: {e}")
                 time.sleep(0.1)
-        
-        # Release camera when done
-        camera.release()
     
     def get_frame(self):
         """Get the most recent frame"""
@@ -358,8 +496,8 @@ class WebcamCapture:
         """Get current FPS"""
         return self.fps
 
-def detect_faces_aws(frame):
-    """Detect faces using AWS Rekognition with minimal quality filtering"""
+def detect_faces_aws_for_zoom(frame):
+    """Detect faces using AWS Rekognition with settings optimized for Zoom"""
     rekognition = get_rekognition_client()
     if not rekognition:
         return []
@@ -378,56 +516,35 @@ def detect_faces_aws(frame):
         # Count raw detections for debugging
         total_faces = len(response['FaceDetails'])
         if total_faces > 0:
-            print(f"Raw detection: {total_faces} faces found")
-            
-            # DEBUG: Print first face quality details if available
-            if total_faces > 0 and 'Quality' in response['FaceDetails'][0]:
-                quality = response['FaceDetails'][0]['Quality']
-                pose = response['FaceDetails'][0]['Pose']
-                landmarks = response['FaceDetails'][0]['Landmarks']
-                print(f"First face details - Brightness: {quality['Brightness']:.1f}, " +
-                      f"Sharpness: {quality['Sharpness']:.1f}, " +
-                      f"Pose(Yaw,Pitch,Roll): ({pose['Yaw']:.1f},{pose['Pitch']:.1f},{pose['Roll']:.1f}), " +
-                      f"Landmarks: {len(landmarks)}")
+            print(f"Raw detection: {total_faces} faces found in Zoom")
         
-        # Extract face details with very minimal filtering
+        # Extract face details with settings optimized for Zoom
+        # Zoom calls often have smaller faces in gallery view
         faces = []
         rejected_faces = {"confidence": 0, "pose": 0, "quality": 0, "landmarks": 0, "size": 0}
         
         for face_detail in response['FaceDetails']:
-            # Relax confidence threshold to allow more detections
-            if face_detail['Confidence'] < 80:  # Lowered from 85
+            # Use lower confidence threshold for Zoom (faces may be smaller)
+            if face_detail['Confidence'] < 75:  # Lowered from 80 for Zoom
                 rejected_faces["confidence"] += 1
                 continue
             
-            # More lenient pose evaluation, especially for frontal faces
+            # More permissive pose evaluation for Zoom (people may be at angles)
             pose = face_detail['Pose']
-            # More permissive for near-frontal faces (small yaw)
-            if (abs(pose['Yaw']) < 20 and abs(pose['Pitch']) > 25) or \
-               (abs(pose['Yaw']) >= 20 and (abs(pose['Yaw']) > 60 or abs(pose['Pitch']) > 20)):  
+            if (abs(pose['Yaw']) > 70 or abs(pose['Pitch']) > 30):  
                 rejected_faces["pose"] += 1
                 continue
             
-            # Almost no quality filtering - just ensure some minimal values
+            # Lower quality requirements for Zoom
             quality = face_detail['Quality']
-            # Check if we have at least one basic facial feature (rather than landmarks)
             if 'Landmarks' in face_detail and len(face_detail['Landmarks']) < 1:
                 rejected_faces["landmarks"] += 1
                 continue
 
-            quality = face_detail['Quality']
-            # Adaptive quality thresholds based on pose
-            # For near-frontal faces, be more lenient with quality requirements
-            if abs(pose['Yaw']) < 15:
-                # Very frontal faces - be more lenient
-                if quality.get('Brightness', 0) < 30 or quality.get('Sharpness', 0) < 30:
-                    rejected_faces["quality"] += 1
-                    continue
-            else:
-                # Side profiles - maintain higher quality requirements
-                if quality.get('Brightness', 0) < 40 or quality.get('Sharpness', 0) < 40:
-                    rejected_faces["quality"] += 1
-                    continue
+            # Lower brightness/sharpness requirements for Zoom
+            if quality.get('Brightness', 0) < 20 or quality.get('Sharpness', 0) < 20:
+                rejected_faces["quality"] += 1
+                continue
                 
             # Get bounding box
             bbox = face_detail['BoundingBox']
@@ -439,10 +556,9 @@ def detect_faces_aws(frame):
             right = int((bbox['Left'] + bbox['Width']) * width)
             bottom = int((bbox['Top'] + bbox['Height']) * height)
             
-            # Adaptive size filtering based on pose
+            # Lower minimum size for Zoom (faces in gallery view are smaller)
             face_height = bottom - top
-            # More lenient for frontal faces
-            min_height = 70 if abs(pose['Yaw']) < 15 else 80
+            min_height = 50  # Reduced minimum height for Zoom
             if face_height < min_height:
                 rejected_faces["size"] += 1
                 continue
@@ -461,7 +577,7 @@ def detect_faces_aws(frame):
         
         # Log detailed filtering results
         if total_faces > 0:
-            print(f"Filtering results: {total_faces} detected, {len(faces)} passed")
+            print(f"Filtering results for Zoom: {total_faces} detected, {len(faces)} passed")
             if total_faces > len(faces):
                 print(f"Rejected due to: confidence={rejected_faces['confidence']}, " +
                       f"pose={rejected_faces['pose']}, quality={rejected_faces['quality']}, " +
@@ -469,7 +585,7 @@ def detect_faces_aws(frame):
         
         return faces
     except Exception as e:
-        print(f"Error detecting faces with AWS: {e}")
+        print(f"Error detecting faces in Zoom with AWS: {e}")
         return []
 
 def is_new_face_aws(face_img):
@@ -503,7 +619,7 @@ def is_new_face_aws(face_img):
             if len(response['FaceMatches']) > 1:
                 print(f"Additional matches: " + 
                       ", ".join([f"{m['Similarity']:.1f}% (ID: {m['Face']['FaceId']})" 
-                                 for m in response['FaceMatches'][1:4]]))
+                                for m in response['FaceMatches'][1:4]]))
             
             return False, matched_face_id
         
@@ -625,18 +741,16 @@ def check_backend_health():
 
 def save_face(frame, bbox):
     """Save a detected face if it's new and upload to backend, or return matched face ID"""
-    # AWS Rekognition handles face tracking
-    
     # Extract face from bounding box
     try:
         left, top, right, bottom = bbox
-
+        
         # Calculate face dimensions
         face_width = right - left
         face_height = bottom - top
 
         # Calculate adaptive margin based on face width
-        margin = min(30, int(face_width * 0.2))  
+        margin = min(20, int(face_width * 0.15))  # Smaller margins for Zoom faces
         top = max(0, top - margin)
         bottom = min(frame.shape[0], bottom + margin)
         left = max(0, left - margin)
@@ -645,8 +759,8 @@ def save_face(frame, bbox):
         # Extract face image
         face_image = frame[top:bottom, left:right]
         
-        # Check if too small or invalid - use a smaller minimum size
-        if face_image.shape[0] < 100 or face_image.shape[1] < 100:
+        # Check if too small or invalid - use a smaller minimum size for Zoom
+        if face_image.shape[0] < 70 or face_image.shape[1] < 70:  # Reduced from 100 for Zoom
             print(f"Face too small: {face_image.shape[0]}x{face_image.shape[1]} pixels")
             return None
         
@@ -692,60 +806,48 @@ def save_face(frame, bbox):
         print(f"Error saving face: {e}")
         return None
 
-def list_camera_devices():
-    """List available camera devices"""
-    available_cameras = []
-    for i in range(10):  # Check first 10 indexes
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            # Camera available
-            available_cameras.append(i)
-            cap.release()
-    return available_cameras
+def clear_face_collection():
+    """Delete and recreate the AWS Rekognition face collection"""
+    rekognition = get_rekognition_client()
+    if not rekognition:
+        print("Error: Could not connect to AWS Rekognition")
+        return False
+    
+    try:
+        # Delete the existing collection
+        print(f"Deleting collection: {COLLECTION_ID}")
+        rekognition.delete_collection(CollectionId=COLLECTION_ID)
+        print(f"Collection {COLLECTION_ID} successfully deleted")
+        
+        # Create a new collection with the same ID
+        print(f"Creating new collection: {COLLECTION_ID}")
+        rekognition.create_collection(CollectionId=COLLECTION_ID)
+        print(f"Collection {COLLECTION_ID} successfully created")
+        
+        print("Face collection cleared")
+        return True
+    except Exception as e:
+        print(f"Error clearing face collection: {e}")
+        return False
 
-def select_camera():
-    """Select a camera from available devices"""
-    available_cameras = list_camera_devices()
-    
-    if not available_cameras:
-        print("No cameras detected!")
-        return None
-    
-    print("\nDetected cameras:")
-    for i, cam_id in enumerate(available_cameras):
-        print(f"{i+1}. Camera {cam_id}")
-    
-    if len(available_cameras) == 1:
-        print(f"Only one camera detected. Using camera {available_cameras[0]}")
-        return available_cameras[0]
-    
-    while True:
-        try:
-            choice = input("\nSelect camera (1-{}): ".format(len(available_cameras)))
-            idx = int(choice) - 1
-            if 0 <= idx < len(available_cameras):
-                return available_cameras[idx]
-            else:
-                print("Invalid choice. Please enter a valid number.")
-        except ValueError:
-            print("Please enter a number.")
-        except KeyboardInterrupt:
-            print("\nSelection cancelled")
-            return None
-
-def main(server_url=None):
+def main(server_url=None, clear_collection=False):
     """Main function"""
     global backend_url, processing_enabled
     
-    print("\n==== AWS Rekognition Webcam Monitor ====")
+    print("\n==== AWS Rekognition Zoom Monitor ====")
+    
+    if clear_collection:
+        if clear_face_collection():
+            print("Face collection cleared successfully")
+        else:
+            print("Failed to clear face collection")
     
     # Check if AWS credentials are configured
-    if AWS_ACCESS_KEY == "YOUR_ACCESS_KEY_HERE" or AWS_SECRET_KEY == "YOUR_SECRET_KEY_HERE":
+    if AWS_ACCESS_KEY is None or AWS_SECRET_KEY is None:
         print("\nERROR: AWS credentials not configured!")
-        print("Please edit this script and replace the placeholder values for:")
+        print("Please set environment variables or use .env file for:")
         print("- AWS_ACCESS_KEY")
         print("- AWS_SECRET_KEY")
-        print("- AWS_REGION (if needed)")
         return
     
     # Check AWS connection
@@ -770,42 +872,122 @@ def main(server_url=None):
         print("Warning: Backend server is not responding. Face processing will be local only.")
         print(f"Make sure the backend server is running at {backend_url}")
     
-    # Select camera
-    camera_id = select_camera()
-    if camera_id is None:
-        print("No camera selected. Exiting.")
+    # Create Zoom capture
+    capture = ZoomCapture()
+    if not capture.start():
+        print("Error: Could not start capturing Zoom. Make sure Zoom is running.")
         return
     
-    # Create webcam capture
-    capture = WebcamCapture(camera_id=camera_id)
-    capture.start()
-    
     # Create monitoring window
-    cv2.namedWindow("Face Monitoring", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Face Monitoring", 800, 600)
+    cv2.namedWindow("Zoom Monitoring", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Zoom Monitoring", 800, 600)
     
-    # Initialize FaceTracker and FaceDetector
-    face_tracker = FaceTracker()
-    face_detector = FaceDetector()
+    # Initialize components for processing
+    face_tracker = FaceTracker(stability_threshold=3)  # More lenient for Zoom
+    face_detector = FaceDetector(face_display_time=face_display_time)
     
     # Variables for processing
-    process_every_n = 20  # Process every 20th frame to reduce costs
+    process_every_n = 15  # Process every 15th frame to reduce costs
     frame_counter = 0
     current_faces = []
     face_detection_count = 0
     matched_faces_count = 0
     
-    # Print cost information
-    print("\nCOST INFORMATION:")
+    # Create a separate thread for face detection
+    face_detection_thread_active = False
+    face_frame = None
+    detected_faces = []
+    
+    def face_detection_worker():
+        nonlocal face_frame, face_detection_count, face_detection_thread_active, detected_faces, matched_faces_count
+        
+        print("Face detection worker started")
+        processing_count = 0
+        
+        while processing_enabled and face_detection_thread_active:
+            if face_frame is not None:
+                local_frame = face_frame.copy()
+                face_frame = None  # Clear the frame so we don't process it again
+                processing_count += 1
+                
+                try:
+                    # Use AWS Rekognition to detect faces with Zoom-optimized parameters
+                    faces = detect_faces_aws_for_zoom(local_frame)
+                    
+                    if faces:
+                        # Update face detector with new faces for display
+                        face_detector.update_faces([face['bbox'] for face in faces])
+                        
+                        # Store all detected faces for display
+                        detected_faces = faces
+                        
+                        # Process faces directly
+                        if len(faces) > 0:
+                            print(f"Processing {len(faces)} detected faces in Zoom")
+                            for face in faces:
+                                bbox = face['bbox']
+                                # Save if it's a new face or get matched ID
+                                result = save_face(local_frame, bbox)
+                                if result:
+                                    if result.get('matched', False):
+                                        # This face matched an existing face
+                                        matched_id = result.get('face_id')
+                                        print(f"Face matched with existing ID: {matched_id}")
+                                        matched_faces_count += 1
+                                        # Register with face detector for display
+                                        face_detector.register_detection(bbox, False)
+                                    else:
+                                        # This is a new face
+                                        face_detection_count += 1
+                                        print(f"New face {face_detection_count} saved with ID: {result.get('face_id')}")
+                                        if 'quality_score' in face:
+                                            print(f"Quality: {face['quality_score']:.1f}, " +
+                                                f"Pose: Yaw={face['pose']['yaw']:.1f}°, " +
+                                                f"Pitch={face['pose']['pitch']:.1f}°")
+                                        # Register with face detector for display
+                                        face_detector.register_detection(bbox, True)
+                except Exception as e:
+                    print(f"Error processing frame in detection thread: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Print periodic status every 10 processed frames
+                if processing_count % 10 == 0:
+                    print(f"Processed {processing_count} frames, found {face_detection_count} unique faces, matched {matched_faces_count} times")
+            
+            # Short sleep to prevent CPU overuse
+            time.sleep(0.01)
+        
+        print("Face detection thread stopped")
+    
+    # Start face detection thread
+    face_detection_thread_active = True
+    detection_thread = threading.Thread(target=face_detection_worker, daemon=True)
+    detection_thread.start()
+    
+    # Print information about the monitoring
+    print("\nZOOM MONITORING INFORMATION:")
+    print("- This script captures the Zoom window and detects faces within it")
     print("- AWS Rekognition: $1 per 1,000 face operations")
     print(f"- Processing 1 frame every {process_every_n} frames to reduce costs")
     print("- Press 'p' to pause processing completely")
+    print("- Press 's' to take a screenshot")
+    print("\nOPTIMIZATIONS FOR ZOOM:")
+    print("- Reduced minimum face size detection for gallery view")
+    print("- More permissive quality thresholds for video call quality")
+    print("- Improved detection parameters for multiple faces")
+    print("\nMAC-SPECIFIC INFO:")
+    if MAC_MODE:
+        if QUARTZ_AVAILABLE:
+            print("- Using Quartz for window detection")
+        else:
+            print("- Using manual window selection (Quartz not available)")
     
     try:
         # Main monitoring loop
         running = True
         while running:
-            # Get frame
+            # Get frame from Zoom
             frame = capture.get_frame()
             
             if frame is None:
@@ -815,40 +997,11 @@ def main(server_url=None):
             # Increment frame counter
             frame_counter += 1
                 
-            # We need to update the face tracker only with detected faces, not with the frame
-            # Note: current_faces is a list of bounding boxes (not tracking objects)
-            
-            # The first frame may not have any faces detected yet
-            if not hasattr(face_tracker, 'tracked_objects'):
-                face_tracker.tracked_objects = []
-                
-            # Process only selected frames to reduce AWS API calls (detection is expensive)
+            # Process only selected frames to reduce AWS API calls
             if processing_enabled and frame_counter % process_every_n == 0:
-                try:
-                    # Use AWS Rekognition to detect faces
-                    faces = detect_faces_aws(frame)
-                    
-                    # Update displayed faces
-                    current_faces = [face['bbox'] for face in faces]
-                    
-                    # Process each detected face
-                    for face in faces:
-                        bbox = face['bbox']
-                        # Save if it's a new face
-                        result = save_face(frame, bbox)
-                        if result:
-                            if result.get('matched', False):
-                                matched_faces_count += 1
-                                print(f"Matched existing face ID: {result.get('face_id')}")
-                            else:
-                                face_detection_count += 1
-                                # Signal the face detector to show recognition indicator
-                                face_detector.register_detection(bbox, True)
-                    
-                    # Update the face detector
-                    face_detector.update(frame, current_faces)
-                except Exception as e:
-                    print(f"Error processing frame: {e}")
+                # Send frame to detection thread
+                if face_frame is None:  # Only update if previous frame was processed
+                    face_frame = frame.copy()
             
             # Create display frame
             display_frame = frame.copy()
@@ -856,11 +1009,12 @@ def main(server_url=None):
             # Let the face detector draw recognition indicators
             display_frame = face_detector.draw_indicators(display_frame)
             
-            # Draw rectangles around faces - all with the same color since we're not using the tracker
-            for (left, top, right, bottom) in current_faces:
+            # Draw rectangles around detected faces
+            for face in detected_faces:
+                bbox = face['bbox']
+                left, top, right, bottom = bbox
                 # Use a standard green color for all faces
                 color = (0, 255, 0)  # Green
-                    
                 cv2.rectangle(display_frame, (left, top), (right, bottom), color, 2)
             
             # Get processing status text
@@ -872,19 +1026,19 @@ def main(server_url=None):
                 status_color = (0, 0, 255)  # Red
             
             # Add status text
-            cv2.putText(display_frame, f"AWS Rekognition (Camera {camera_id})", 
+            cv2.putText(display_frame, "AWS Rekognition Zoom Monitor", 
                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(display_frame, f"FPS: {capture.get_fps():.1f} | Faces: {len(current_faces)}", 
+            cv2.putText(display_frame, f"FPS: {capture.get_fps():.1f} | Faces: {len(detected_faces)}", 
                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(display_frame, f"New faces: {face_detection_count} | Matched: {matched_faces_count}", 
                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(display_frame, status_text, 
                       (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-            cv2.putText(display_frame, "Press 'q' to quit, 'p' to pause/resume processing", 
+            cv2.putText(display_frame, "Press 'q' to quit, 'p' to pause/resume, 's' for screenshot", 
                       (10, display_frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
                 
             # Show frame
-            cv2.imshow("Face Monitoring", display_frame)
+            cv2.imshow("Zoom Monitoring", display_frame)
             
             # Check for key press
             key = cv2.waitKey(1) & 0xFF
@@ -896,6 +1050,12 @@ def main(server_url=None):
                 processing_enabled = not processing_enabled
                 status = "RESUMED" if processing_enabled else "PAUSED"
                 print(f"Face processing {status}")
+            elif key == ord('s'):
+                # Take a screenshot
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                screenshot_path = os.path.join(save_dir, f"zoom_screenshot_{timestamp}.jpg")
+                cv2.imwrite(screenshot_path, display_frame)
+                print(f"Screenshot saved: {screenshot_path}")
     
     except KeyboardInterrupt:
         print("Monitoring stopped by user")
@@ -903,19 +1063,23 @@ def main(server_url=None):
         print(f"Error during monitoring: {e}")
     finally:
         # Clean up
+        face_detection_thread_active = False
+        detection_thread.join(timeout=1.0)
         capture.stop()
         cv2.destroyAllWindows()
         print("\nMonitoring stopped")
         print(f"- Faces saved to: {os.path.abspath(save_dir)}")
+        
+        # Get face count from AWS collection
+        face_count = get_collection_face_count()
+        print(f"- {face_count} unique faces in collection")
         print(f"- {face_detection_count} new face detections")
         print(f"- {matched_faces_count} matched face detections")
 
 if __name__ == "__main__":
-    import sys
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='AWS Rekognition Webcam Monitor')
-    parser.add_argument('--server', default=None, help='Backend server URL (default: http://localhost:8080)')
+    parser = argparse.ArgumentParser(description='AWS Rekognition Zoom Monitor')
+    parser.add_argument('--server', default=None, help='Backend server URL (default: http://18.217.189.106:8080)')
+    parser.add_argument('--clear', action='store_true', help='Clear all faces from the collection')
     
     args = parser.parse_args()
-    main(server_url=args.server)
+    main(server_url=args.server, clear_collection=args.clear)

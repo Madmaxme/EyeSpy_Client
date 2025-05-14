@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Backend server configuration
-DEFAULT_BACKEND_URL = 'http://127.0.0.1:8080' #http://127.0.0.1:8080
+DEFAULT_BACKEND_URL = 'http://localhost:8080' #http://localhost:8080
 backend_url = os.environ.get("EYESPY_BACKEND_URL", DEFAULT_BACKEND_URL)
 
 def upload_photo(file_path):

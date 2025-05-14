@@ -743,7 +743,7 @@ InstaRec.ScreenRegionSelector.get_screen_region = MethodType(get_screen_region_o
 InstaRec.main = main_override
 
 # Run InstaRec main with the server URL
-backend_url = "{self.backend_url or 'http://35.180.226.30:8080'}"
+backend_url = "{self.backend_url or 'http://18.217.189.106:8080'}"
 try:
     InstaRec.main(server_url=backend_url)
 except Exception as e:
