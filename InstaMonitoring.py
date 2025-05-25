@@ -825,9 +825,23 @@ except Exception as e:
                             print("Monitoring stopped before returning to target URL")
                             break
                     
+                    # Refresh the page to check for updated live status
+                    print(f"Refreshing page to check if @{self.target_user} is live...")
+                    try:
+                        self.driver.refresh()
+                        # Wait for the page to load after refresh
+                        WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "body"))
+                        )
+                        # Additional wait to ensure all dynamic content loads
+                        time.sleep(2)
+                        print("Page refreshed successfully")
+                    except Exception as refresh_error:
+                        print(f"Error refreshing page: {refresh_error}")
+                    
                     # Check if user is live
                     is_live = self.check_if_user_is_live()
-                    
+                
                     if is_live:
                         # Join the livestream
                         if self.join_livestream():

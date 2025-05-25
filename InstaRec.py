@@ -329,7 +329,7 @@ class FaceDetector:
         return result_frame
 
 def detect_faces_aws(frame):
-    """Detect faces using AWS Rekognition with minimal quality filtering"""
+    """Detect faces using AWS Rekognition with stricter quality filtering (from Meets implementation)"""
     rekognition = get_rekognition_client()
     if not rekognition:
         return []
@@ -339,10 +339,10 @@ def detect_faces_aws(frame):
     img_bytes = img_encoded.tobytes()
     
     try:
-        # Detect faces with AWS
+        # Detect faces with AWS - using ALL attributes to get quality metrics
         response = rekognition.detect_faces(
             Image={'Bytes': img_bytes},
-            Attributes=['DEFAULT']
+            Attributes=['ALL']  # Changed from DEFAULT to ALL to get quality metrics
         )
         
         # Count raw detections for debugging
@@ -350,23 +350,54 @@ def detect_faces_aws(frame):
         if total_faces > 0:
             print(f"Raw detection: {total_faces} faces found")
             
-        # Extract face details with minimal filtering for Instagram
+        # Extract face details with stricter filtering (from Meets implementation)
         faces = []
         rejected_faces = {"confidence": 0, "pose": 0, "quality": 0, "landmarks": 0, "size": 0}
         
         for face_detail in response['FaceDetails']:
-            # Confidence threshold
-            if face_detail['Confidence'] < 80:
+            # 1. Confidence threshold - increased to match Meets (90%)
+            if face_detail['Confidence'] < 90:
                 rejected_faces["confidence"] += 1
                 continue
             
-            # More lenient pose evaluation for Instagram Live
+            # 2. Quality checks (from Meets implementation)
+            if 'Quality' in face_detail:
+                # Reject faces with low sharpness (blurry faces)
+                if face_detail['Quality'].get('Sharpness', 0) < 50:
+                    rejected_faces["quality"] += 1
+                    continue
+                
+                # Reject faces with low brightness (poorly lit faces)
+                if face_detail['Quality'].get('Brightness', 0) < 30:
+                    rejected_faces["quality"] += 1
+                    continue
+            
+            # 3. Stricter pose evaluation (from Meets implementation)
             pose = face_detail['Pose']
-            # Instagram users tend to look directly at camera, so be permissive
-            if abs(pose['Yaw']) > 60 or abs(pose['Pitch']) > 40:  
+            # Reject extreme side profiles (yaw > 30 degrees in either direction)
+            if abs(pose['Yaw']) > 30:
                 rejected_faces["pose"] += 1
                 continue
                 
+            # Reject extreme up/down tilts (pitch > 30 degrees in either direction)
+            if abs(pose['Pitch']) > 30:
+                rejected_faces["pose"] += 1
+                continue
+                
+            # Reject extremely tilted faces (roll > 30 degrees in either direction)
+            if abs(pose['Roll']) > 30:
+                rejected_faces["pose"] += 1
+                continue
+            
+            # 4. Check for minimum landmarks (from Meets implementation)
+            if 'Landmarks' in face_detail:
+                # A complete face should have all landmarks detected
+                expected_landmarks = 5  # Basic landmarks: eyes, nose, mouth points
+                detected_landmarks = len(face_detail['Landmarks'])
+                if detected_landmarks < expected_landmarks:
+                    rejected_faces["landmarks"] += 1
+                    continue
+            
             # Get bounding box
             bbox = face_detail['BoundingBox']
             height, width, _ = frame.shape
@@ -377,13 +408,14 @@ def detect_faces_aws(frame):
             right = int((bbox['Left'] + bbox['Width']) * width)
             bottom = int((bbox['Top'] + bbox['Height']) * height)
             
-            # Minimum size check - smaller for Instagram
+            # 5. Increased minimum size check (from Meets implementation)
+            face_width = right - left
             face_height = bottom - top
-            if face_height < 60:  # Lower threshold for Instagram
+            if face_height < 100 or face_width < 100:  # Increased from 60 to 100
                 rejected_faces["size"] += 1
                 continue
             
-            # If passed all filters, add to faces list
+            # If passed all stricter filters, add to faces list
             faces.append({
                 'bbox': (left, top, right, bottom),
                 'confidence': face_detail['Confidence'],
@@ -394,13 +426,18 @@ def detect_faces_aws(frame):
                 }
             })
         
+        # Log rejection reasons
+        if total_faces > 0 and len(faces) < total_faces:
+            print(f"Rejected faces: {rejected_faces}")
+        
         return faces
     except Exception as e:
         print(f"Error detecting faces with AWS: {e}")
         return []
 
 def is_new_face_aws(face_img):
-    """Check if face is new using AWS Rekognition face search"""
+    """Check if face is new using AWS Rekognition face search
+    Using stricter quality metrics from Meets implementation"""
     rekognition = get_rekognition_client()
     if not rekognition:
         print("Could not get Rekognition client")
@@ -412,36 +449,55 @@ def is_new_face_aws(face_img):
     
     try:
         # Search for face in collection with similarity threshold of 80%
+        # This is the same threshold used in the Meets implementation
         response = rekognition.search_faces_by_image(
             CollectionId=COLLECTION_ID,
             Image={'Bytes': img_bytes},
             FaceMatchThreshold=80.0, 
-            MaxFaces=3  
+            MaxFaces=1  # Reduced from 3 to 1 to match Meets implementation
         )
         
         # If matches found, not a new face
         if response['FaceMatches']:
             best_match = max(response['FaceMatches'], key=lambda x: x['Similarity'])
             matched_face_id = best_match['Face']['FaceId']
-            print(f"Found matching face with {best_match['Similarity']:.1f}% similarity (ID: {matched_face_id})")
+            similarity = best_match['Similarity']
+            print(f"Found matching face with {similarity:.1f}% similarity (ID: {matched_face_id})")
             return False, matched_face_id
         
-        # No matches found, index this face
+        # No matches found, index this face with stricter quality filter
         index_response = rekognition.index_faces(
             CollectionId=COLLECTION_ID,
             Image={'Bytes': img_bytes},
             MaxFaces=1,
-            QualityFilter='AUTO', 
-            DetectionAttributes=['DEFAULT']
+            QualityFilter='HIGH',  # Changed from AUTO to HIGH to match Meets implementation
+            DetectionAttributes=['ALL']  # Changed from DEFAULT to ALL to match Meets implementation
         )
         
         # Extract the Face ID
         if index_response.get('FaceRecords'):
             face_id = index_response['FaceRecords'][0]['Face']['FaceId']
             print(f"Indexed new face with ID: {face_id}")
+            
+            # Log quality metrics if available
+            if 'FaceDetail' in index_response['FaceRecords'][0]:
+                face_detail = index_response['FaceRecords'][0]['FaceDetail']
+                quality_info = {}
+                
+                if 'Quality' in face_detail:
+                    quality_info['brightness'] = face_detail['Quality'].get('Brightness', 'N/A')
+                    quality_info['sharpness'] = face_detail['Quality'].get('Sharpness', 'N/A')
+                
+                if 'Pose' in face_detail:
+                    quality_info['yaw'] = face_detail['Pose'].get('Yaw', 'N/A')
+                    quality_info['pitch'] = face_detail['Pose'].get('Pitch', 'N/A')
+                    quality_info['roll'] = face_detail['Pose'].get('Roll', 'N/A')
+                
+                print(f"Face quality metrics: {quality_info}")
+            
             return True, face_id
         else:
-            print("Face not indexed - may not meet quality requirements")
+            print("Face not indexed - did not meet HIGH quality requirements")
             return True, None
     except Exception as e:
         print(f"Error checking face with AWS: {str(e)}")
@@ -501,7 +557,8 @@ def check_backend_health():
         return False
 
 def process_face(frame, bbox):
-    """Process a detected face - extract, check if new, and upload"""
+    """Process a detected face - extract, check if new, and upload
+    Using stricter quality metrics from Meets implementation"""
     try:
         left, top, right, bottom = bbox
         
@@ -509,7 +566,8 @@ def process_face(frame, bbox):
         face_width = right - left
         face_height = bottom - top
         
-        # Add some margin around the face
+        # Add some margin around the face (consistent with Meets implementation)
+        # Using a percentage-based margin to ensure proper face context
         margin = min(30, int(face_width * 0.2))
         top = max(0, top - margin)
         bottom = min(frame.shape[0], bottom + margin)
@@ -519,9 +577,16 @@ def process_face(frame, bbox):
         # Extract face image
         face_image = frame[top:bottom, left:right]
         
-        # Check face size
+        # Strict size check (consistent with Meets implementation)
+        # Minimum 100x100 pixels for face recognition
         if face_image.shape[0] < 100 or face_image.shape[1] < 100:
-            print(f"Face too small: {face_image.shape[0]}x{face_image.shape[1]} pixels")
+            print(f"Face too small: {face_image.shape[0]}x{face_image.shape[1]} pixels (minimum 100x100)")
+            return None
+            
+        # Additional quality check - ensure face isn't too large (prevents very close faces)
+        # This helps filter out faces that are too close to the camera
+        if face_image.shape[0] > frame.shape[0] * 0.8 or face_image.shape[1] > frame.shape[1] * 0.8:
+            print(f"Face too large: {face_image.shape[0]}x{face_image.shape[1]} pixels (occupies >80% of frame)")
             return None
         
         # Check if enough time has passed since last detection
@@ -529,6 +594,7 @@ def process_face(frame, bbox):
             return None
         
         # Check if this is a new face using AWS Rekognition
+        # The is_new_face_aws function will use the same collection as before
         is_new, face_id = is_new_face_aws(face_image)
         
         if not is_new:
@@ -540,6 +606,7 @@ def process_face(frame, bbox):
             return None
         
         # Upload face to backend (without saving locally)
+        # Using a thread to avoid blocking the main processing loop
         thread = threading.Thread(
             target=upload_to_backend,
             args=(face_image,),

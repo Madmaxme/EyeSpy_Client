@@ -6,7 +6,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import InstaRec
 
 # Set the region directly
-region = {"left": 311, "top": 180, "width": 434, "height": 652}
+region = {"left": 311, "top": 180, "width": 434, "height": 651}
 
 # Override the GUI method to avoid Tkinter issues
 from types import MethodType
